@@ -191,6 +191,7 @@ function efi_vars() {
 }
 
 function vm_boot() {
+  local AUDIO_DEV=""
   local BALLOON="-device virtio-balloon"
   local BOOT_STATUS=""
   local CPU=""
@@ -392,6 +393,9 @@ function vm_boot() {
         elif [ -e "/usr/share/edk2/ovmf/OVMF_CODE.fd" ]; then
           EFI_CODE="/usr/share/edk2/ovmf/OVMF_CODE.fd"
           efi_vars "/usr/share/edk2/ovmf/OVMF_VARS.fd" "${EFI_VARS}"
+        elif [ -e "/usr/share/OVMF/OVMF_CODE.fd" ]; then
+          EFI_CODE="/usr/share/OVMF/OVMF_CODE.fd"
+          efi_vars "/usr/share/OVMF/OVMF_VARS.fd" "${EFI_VARS}"
         elif [ -e "/usr/share/OVMF/x64/OVMF_CODE.fd" ]; then
           EFI_CODE="/usr/share/OVMF/x64/OVMF_CODE.fd"
           efi_vars "/usr/share/OVMF/x64/OVMF_VARS.fd" "${EFI_VARS}"
@@ -464,9 +468,9 @@ function vm_boot() {
       # Tune Qemu optimisations based on the macOS release, or fallback to lowest
       # common supported options if none is specified.
       #   * VirtIO Block Media doesn't work in High Sierra (at all) or the Mojave (Recovery Image)
-      #   * VirtIO Network is supported in Big Sur
-      #   * VirtIO Memory Balloning is supported in Big Sur (https://pmhahn.github.io/virtio-balloon/)
-      #   * VirtIO RNG is supported in Big Sur, but exposed to all guests.
+      #   * VirtIO Network is supported since Big Sur
+      #   * VirtIO Memory Balloning is supported since Big Sur (https://pmhahn.github.io/virtio-balloon/)
+      #   * VirtIO RNG is supported since Big Sur, but exposed to all guests by default.
       case ${macos_release} in
         catalina)
           BALLOON=""
@@ -490,15 +494,9 @@ function vm_boot() {
           ;;
       esac
       OSK=$(echo "bheuneqjbexolgurfrjbeqfthneqrqcyrnfrqbagfgrny(p)NccyrPbzchgreVap" | tr 'A-Za-z' 'N-ZA-Mn-za-m')
-      GUEST_TWEAKS="-device isa-applesmc,osk=${OSK} -no-hpet -global kvm-pit.lost_tick_policy=discard"
+      GUEST_TWEAKS="-no-hpet -global kvm-pit.lost_tick_policy=discard -device isa-applesmc,osk=${OSK}"
       if [ -z "${disk_size}" ]; then
         disk_size="96G"
-      fi
-      # fixme: spice problems with usb-tablet - can't move mouse, clicks work
-      # working https://raw.githubusercontent.com/kholia/OSX-KVM/1cc6430f96b452cb78b9a079c34bb9933144ce18/macOS-libvirt-Catalina.xml
-      # https://github.com/wimpysworld/quickemu/issues/222
-      if [ "${OUTPUT}" == "none" ]; then
-        MOUSE="usb-mouse"
       fi
       ;;
     windows)
@@ -507,6 +505,13 @@ function vm_boot() {
         CPU="${CPU},topoext"
       fi
       GUEST_TWEAKS="-no-hpet -global kvm-pit.lost_tick_policy=discard"
+
+      # Disable S3 support in the VM to ensure Windows can boot with SecureBoot enabled
+      #  - https://wiki.archlinux.org/title/QEMU#VM_does_not_boot_when_using_a_Secure_Boot_enabled_OVMF
+      if [ "${secureboot}" == "on" ]; then
+        GUEST_TWEAKS="${GUEST_TWEAKS} -global ICH9-LPC.disable_s3=1"
+      fi
+
       if [ -z "${disk_size}" ]; then
         disk_size="64G"
       fi
@@ -597,6 +602,12 @@ function vm_boot() {
     echo " - CD-ROM:   ${fixed_iso}"
   fi
 
+  # Setup the appropriate audio device based on the display output
+  case ${OUTPUT} in
+    spice|spice-app|none) AUDIO_DEV="spice,id=audio0,out.mixing-engine=off";;
+    *) AUDIO_DEV="pa,id=audio0,out.mixing-engine=off,out.stream-name=${LAUNCHER}-${VMNAME},in.stream-name=${LAUNCHER}-${VMNAME}";;
+  esac
+
   # Determine a sane resolution for Linux guests.
   if [ "${guest_os}" == "linux" ]; then
     local X_RES=1152
@@ -639,15 +650,12 @@ function vm_boot() {
       *) DISPLAY_DEVICE="virtio-vga";;
     esac
   elif [ "${guest_os}" == "macos" ]; then
-    # Tweak video device based on the guest macOS release.
     # Displays in System Preferences can be used to select a resolution if:
-    #  - qxl is used on Big Sur and Catalina
-    #  - VGA is used on Mojave, although available resolutions are all 4:3
+    #  - Mojave only offers 4:3 resolutions
     #  - High Sierra will run at the default 1920x1080 only.
-    case ${macos_release} in
-      catalina|big-sur|monterey) DISPLAY_DEVICE="qxl";;
-      *) DISPLAY_DEVICE="VGA";;
-    esac
+    # QXL prevents seamless mouse working with a SPICE client
+    #  - https://github.com/wimpysworld/quickemu/issues/222
+    DISPLAY_DEVICE="VGA"
   elif [ "${guest_os}" == "windows" ]; then
     DISPLAY_DEVICE="qxl-vga"
   else
@@ -656,7 +664,7 @@ function vm_boot() {
 
   echo -n " - Display:  ${OUTPUT^^}, ${DISPLAY_DEVICE}"
 
-# Map Quickemu OUTPUT to QEMU -display
+  # Map Quickemu OUTPUT to QEMU -display
   case ${OUTPUT} in
     gtk)
       DISPLAY_RENDER="${OUTPUT},grab-on-hover=on,zoom-to-fit=off"
@@ -691,9 +699,13 @@ function vm_boot() {
   fi
 
   # Allocate VRAM to VGA devices
-  if [ "${DISPLAY_DEVICE}" == "qxl-vga" ] || [ "${DISPLAY_DEVICE}" == "VGA" ]; then
-    VIDEO="${VIDEO},vgamem_mb=128"
-  fi
+  case ${DISPLAY_DEVICE} in
+    bochs-display) VIDEO="${VIDEO},vgamem=67108864";;
+    qxl|qxl-vga) VIDEO="${VIDEO},ram_size=65536,vram_size=65536,vgamem_mb=64";;
+    ati-vga|cirrus-vga|VGA) VIDEO="${VIDEO},vgamem_mb=64";;
+  esac
+
+  # Add fullscreen options
   VIDEO="${VIDEO} ${FULLSCREEN}"
 
   # Set the hostname of the VM
@@ -746,12 +758,16 @@ function vm_boot() {
       SPICE="${SPICE},port=${SPICE_PORT}"
     fi
 
-    # Reference: https://gitlab.gnome.org/GNOME/phodav/-/issues/5
-    if [ "${guest_os}" != "macos" ] && [ -n "${PUBLIC}" ]; then
-      echo " - WebDAV:   On guest: dav://localhost:9843/"
-    else
-      echo " - WebDAV:   On guest: build spice-webdavd (https://gitlab.gnome.org/GNOME/phodav/-/merge_requests/24)"
-      echo " - WebDAV:   On guest: Finder>Connect to Server>http://localhost:9843/"
+    if [ -n "${PUBLIC}" ]; then
+      case ${guest_os} in
+        macos)
+          # Reference: https://gitlab.gnome.org/GNOME/phodav/-/issues/5
+          echo " - WebDAV:   On guest: build spice-webdavd (https://gitlab.gnome.org/GNOME/phodav/-/merge_requests/24)"
+          echo " - WebDAV:   On guest: Finder -> Connect to Server -> http://localhost:9843/"
+          ;;
+        *)
+          echo " - WebDAV:   On guest: dav://localhost:9843/";;
+      esac
     fi
   fi
 
@@ -808,7 +824,7 @@ function vm_boot() {
          -device usb-ehci,id=input
          -device usb-kbd,bus=input.0
          -device ${MOUSE},bus=input.0
-         -audiodev pa,id=audio0,out.mixing-engine=off,out.stream-name=${LAUNCHER}-${VMNAME},in.stream-name=${LAUNCHER}-${VMNAME}
+         -audiodev ${AUDIO_DEV}
          -device intel-hda -device hda-duplex,audiodev=audio0
          -rtc base=localtime,clock=host,driftfix=slew
          -spice ${SPICE}
@@ -817,13 +833,27 @@ function vm_boot() {
          -device virtserialport,chardev=agent0,name=org.qemu.guest_agent.0
          -chardev spicevmc,id=vdagent0,name=vdagent
          -device virtserialport,chardev=vdagent0,name=com.redhat.spice.0
+         -chardev spiceport,id=webdav0,name=org.spice-space.webdav.0
+         -device virtserialport,chardev=webdav0,name=org.spice-space.webdav.0
          -device virtio-rng-pci,rng=rng0
          -object rng-random,id=rng0,filename=/dev/urandom
+         -device ${USB_HOST_PASSTHROUGH_CONTROLLER},id=spicepass
+         -chardev spicevmc,id=usbredirchardev1,name=usbredir
+         -device usb-redir,chardev=usbredirchardev1,id=usbredirdev1
+         -chardev spicevmc,id=usbredirchardev2,name=usbredir
+         -device usb-redir,chardev=usbredirchardev2,id=usbredirdev2
+         -chardev spicevmc,id=usbredirchardev3,name=usbredir
+         -device usb-redir,chardev=usbredirchardev3,id=usbredirdev3
+         -device pci-ohci,id=smartpass
+         -device usb-ccid
+         -chardev spicevmc,id=ccid,name=smartcard
+         -device ccid-card-passthru,chardev=ccid
          -monitor none
          -serial mon:stdio)
 
   if [ -n "${bridge}" ]; then
     # Enable bridge mode networking
+    # shellcheck disable=SC2054,SC2206
     args+=(-nic bridge,br=${bridge},model=virtio-net-pci)
   else
     # shellcheck disable=SC2054,SC2206
@@ -898,43 +928,9 @@ function vm_boot() {
     args+=(-device ide-hd,drive=SystemDisk,bus=ahci.0,bootindex=0
           -drive id=SystemDisk,if=none,format=qcow2,file="${disk_img}" ${STATUS_QUO})
   else
+    # shellcheck disable=SC2054,SC2206
     args+=(-device virtio-blk-pci,drive=SystemDisk
            -drive id=SystemDisk,if=none,format=qcow2,file="${disk_img}" ${STATUS_QUO})
-  fi
-
-  # shellcheck disable=SC2054,SC2206
-  if [ "${USB_HOST_PASSTHROUGH_CONTROLLER}" == "qemu-xhci" ]; then
-    args+=(-device ${USB_HOST_PASSTHROUGH_CONTROLLER},id=spicepass
-           -chardev spicevmc,id=usbredirchardev1,name=usbredir
-           -device usb-redir,chardev=usbredirchardev1,id=usbredirdev1
-           -chardev spicevmc,id=usbredirchardev2,name=usbredir
-           -device usb-redir,chardev=usbredirchardev2,id=usbredirdev2
-           -chardev spicevmc,id=usbredirchardev3,name=usbredir
-           -device usb-redir,chardev=usbredirchardev3,id=usbredirdev3
-           -device usb-ccid
-           -chardev spicevmc,id=ccid,name=smartcard
-           -device ccid-card-passthru,chardev=ccid
-           -device virtio-serial-pci
-           -chardev spiceport,id=webdav0,name=org.spice-space.webdav.0
-           -device virtserialport,chardev=webdav0,name=org.spice-space.webdav.0)
-  else
-    # https://www.spice-space.org/usbredir.html
-    args+=(-device ich9-usb-ehci1,id=usb
-           -device ich9-usb-uhci1,masterbus=usb.0,firstport=0,multifunction=on
-           -device ich9-usb-uhci2,masterbus=usb.0,firstport=2
-           -device ich9-usb-uhci3,masterbus=usb.0,firstport=4
-           -chardev spicevmc,name=usbredir,id=usbredirchardev1
-           -device usb-redir,chardev=usbredirchardev1,id=usbredirdev1
-           -chardev spicevmc,name=usbredir,id=usbredirchardev2
-           -device usb-redir,chardev=usbredirchardev2,id=usbredirdev2
-           -chardev spicevmc,name=usbredir,id=usbredirchardev3
-           -device usb-redir,chardev=usbredirchardev3,id=usbredirdev3
-           -device usb-ccid
-           -chardev spicevmc,id=ccid,name=smartcard
-           -device ccid-card-passthru,chardev=ccid
-           -device virtio-serial-pci
-           -chardev spiceport,id=webdav0,name=org.spice-space.webdav.0
-           -device virtserialport,chardev=webdav0,name=org.spice-space.webdav.0)
   fi
 
   # https://wiki.qemu.org/Documentation/9psetup
@@ -1060,7 +1056,7 @@ VMPATH=""
 
 readonly LAUNCHER=$(basename "${0}")
 readonly DISK_MIN_SIZE=$((197632 * 8))
-readonly VERSION="2.3.1"
+readonly VERSION="2.3.2"
 
 # PUBLICSHARE is the only directory exposed to guest VMs for file
 # sharing via 9P, spice-webdavd and Samba. This path is not configurable.
